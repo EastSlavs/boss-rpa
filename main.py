@@ -10,23 +10,76 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
-from filters import Decision, evaluate
+from filters import Decision, compact, evaluate
 
 BASE_DIR = Path(__file__).resolve().parent
 LOG = logging.getLogger("boss-rpa")
 
 
-def load_config(path: Path) -> dict:
+def read_config(path: Path) -> dict:
     with path.open(encoding="utf-8-sig") as handle:
         config = json.load(handle)
+    if not isinstance(config, dict):
+        raise ValueError(f"{path.name} 必须是 JSON 对象")
+    return config
+
+
+def load_config(path: Path) -> dict:
+    config = read_config(path)
+    default_path = BASE_DIR / "config.json"
+    if path.resolve() != default_path.resolve():
+        defaults = read_config(default_path)
+        for section, default in defaults.items():
+            if isinstance(default, dict) and isinstance(config.get(section), dict):
+                config[section] = {**default, **config[section]}
+        config = {**defaults, **config}
+
     if config.get("mode") not in {"preview", "auto"}:
         raise ValueError("mode 只能为 preview 或 auto")
     if config.get("platform") not in {"boss", "51job", "zhilian"}:
         raise ValueError("platform 只能为 boss、51job 或 zhilian")
-    cities = config["filters"]["allowed_cities"]
-    if not isinstance(cities, list) or not cities or not all(isinstance(city, str) and city.strip() for city in cities):
-        raise ValueError("allowed_cities 必须是非空城市列表，例如 [\"武汉\"]")
-    days = config["filters"]["max_active_days"]
+    required = {
+        "filters": ("allowed_cities", "max_active_days", "unknown_activity", "exclude_title_keywords"),
+        "activity": ("text_days", "unit_minutes", "suffixes"),
+        "ocr": ("detail_markers",),
+        "button_texts": ("clickable", "contacted"),
+        "limits": ("contact_checks",),
+    }
+    for section, keys in required.items():
+        if not isinstance(config.get(section), dict):
+            raise ValueError(f"配置需要 {section} 对象，请使用新版 config.json")
+        for key in keys:
+            if key not in config[section]:
+                raise ValueError(f"配置缺少 {section}.{key}，请使用新版 config.json 补齐")
+
+    settings, activity, buttons = config["filters"], config["activity"], config["button_texts"]
+    for name, values, allow_empty in [
+        ("filters.allowed_cities", settings["allowed_cities"], False),
+        ("filters.exclude_title_keywords", settings["exclude_title_keywords"], True),
+        ("activity.suffixes", activity["suffixes"], False),
+        ("ocr.detail_markers", config["ocr"]["detail_markers"], False),
+        ("button_texts.clickable", buttons["clickable"], False),
+        ("button_texts.contacted", buttons["contacted"], False),
+    ]:
+        if (not isinstance(values, list) or (not allow_empty and not values)
+                or not all(isinstance(value, str) and compact(value) for value in values)):
+            raise ValueError(f"{name} 必须是字符串列表，文字不能为空")
+    if set(map(compact, buttons["clickable"])) & set(map(compact, buttons["contacted"])):
+        raise ValueError("button_texts 的可点击和已沟通文字不能重复")
+    if settings["unknown_activity"] not in ("review", "skip"):
+        raise ValueError("filters.unknown_activity 只能为 review 或 skip")
+    for name, table, allow_zero in [
+        ("activity.text_days", activity["text_days"], True),
+        ("activity.unit_minutes", activity["unit_minutes"], False),
+    ]:
+        if not isinstance(table, dict) or (not allow_zero and not table):
+            raise ValueError(f"{name} 必须是文字到数字的映射")
+        for label, value in table.items():
+            if (not compact(label) or isinstance(value, bool) or not isinstance(value, (int, float))
+                    or not 0 <= value < float("inf") or (value == 0 and not allow_zero)):
+                raise ValueError(f"{name} 的文字或数值无效：{label}")
+
+    days = settings["max_active_days"]
     if isinstance(days, bool) or not isinstance(days, (int, float)) or not 0 <= days <= 3660:
         raise ValueError("max_active_days 必须为 0～3660 的数字")
     for name, region in [("window_region", config["window_region"]),
@@ -192,11 +245,12 @@ def contact(desktop, reader, config, job):
     desktop.click(current, point)
     time.sleep(config["timing"]["after_click_seconds"])
     backed = False
-    for checks_left in (2, 1, 0):
+    contacted_texts = config["button_texts"]["contacted"]
+    for checks_left in range(config["limits"]["contact_checks"] - 1, -1, -1):
         after = desktop.capture()
         after_job = reader.analyze(after.image)
-        if after_job.is_detail and after_job.key == job.key and after_job.button_text in {"继续沟通", "已沟通", "已投递"}:
-            return after, after_job, Decision("contacted", "按钮已变为继续沟通或已投递")
+        if after_job.is_detail and after_job.key == job.key and after_job.button_text in contacted_texts:
+            return after, after_job, Decision("contacted", f"按钮已变为{after_job.button_text}")
         if checks_left == 0:
             break
         if not after_job.is_detail and not backed:

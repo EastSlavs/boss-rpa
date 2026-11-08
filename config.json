@@ -5,12 +5,44 @@
   "window_region": [0.0, 0.0, 1.0, 1.0],
   "filters": {
     "allowed_cities": ["武汉"],
-    "max_active_days": 7
+    "max_active_days": 7,
+    "unknown_activity": "review",
+    "exclude_title_keywords": [
+      "经理助理", "行政助理", "行政专员", "行政文员", "办公室文员", "前台接待",
+      "人事助理", "人事专员", "招聘助理", "招聘专员",
+      "销售代表", "销售专员", "电话销售", "客服专员",
+      "数据审核专员", "数据审核员", "内容审核专员", "内容审核员",
+      "YouTube运营", "短视频运营", "新媒体运营"
+    ]
+  },
+  "activity": {
+    "text_days": {
+      "在线": 0,
+      "刚刚活跃": 0, "刚刚回复": 0,
+      "刚才活跃": 0, "刚才回复": 0,
+      "今日活跃": 0, "今日回复": 0,
+      "今天活跃": 0, "今天回复": 0,
+      "昨日活跃": 1, "昨日回复": 1,
+      "昨天活跃": 1, "昨天回复": 1,
+      "前天活跃": 2, "前天回复": 2,
+      "本周活跃": 7, "本周回复": 7,
+      "本月活跃": 31, "本月回复": 31
+    },
+    "unit_minutes": {
+      "分钟": 1, "小时": 60, "日": 1440, "天": 1440,
+      "周": 10080, "个月": 44640, "月": 44640, "年": 527040
+    },
+    "suffixes": ["活跃", "回复"]
   },
   "ocr": {
     "header_region": [0.02, 0.08, 0.98, 0.60],
     "footer_region": [0.02, 0.82, 0.98, 1.0],
-    "min_confidence": 0.65
+    "min_confidence": 0.65,
+    "detail_markers": ["职位详情", "岗位详情", "职位描述"]
+  },
+  "button_texts": {
+    "clickable": ["立即沟通", "去聊聊", "立即投递"],
+    "contacted": ["继续沟通", "已沟通", "已投递"]
   },
   "button_templates": {
     "boss": "images/btn.png",
@@ -28,6 +60,7 @@
     "max_jobs": 100,
     "max_clicks": 50,
     "max_consecutive_unknown": 3,
+    "contact_checks": 3,
     "swipe_retries": 2
   },
   "save_preview_screenshots": false

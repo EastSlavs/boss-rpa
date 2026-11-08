@@ -42,22 +42,12 @@ class Decision:
     reason: str
 
 
-DETAIL = re.compile(r"职位详情|岗位详情|职位描述")
 META = re.compile(
     r"(?:\d+[-—~至]?\d*年|经验不限|不限经验|无需经验|应届|在校|"
     r"大专|本科|硕士|博士|中专|高中|初中|学历不限)"
 )
-STATUS = re.compile(r"活跃|回复|在线")
 SALARY = re.compile(r"^[\d.]+[-~—][\d.]+[Kk万千元].*$|^面议$")
 SEPARATOR = r"[·•・.。|｜]"
-
-DEFAULT_EXCLUDED_TITLES = (
-    "经理助理", "行政助理", "行政专员", "行政文员", "办公室文员", "前台接待",
-    "人事助理", "人事专员", "招聘助理", "招聘专员",
-    "销售代表", "销售专员", "电话销售", "客服专员",
-    "数据审核专员", "数据审核员", "内容审核专员", "内容审核员",
-    "YouTube运营", "短视频运营", "新媒体运营",
-)
 
 
 def group_rows(lines: list[TextLine]) -> list[list[TextLine]]:
@@ -98,39 +88,41 @@ def chinese_number(text: str) -> float | None:
     return float(total + current) if text else None
 
 
-def activity_days(text: str) -> float | None:
+def activity_term_pattern(term: str) -> str:
+    term = compact(term)
+    # “今日回复率高”只表示回复率，不能作为最近一次回复的时间。
+    return re.escape(term) + (r"(?!率)" if term.endswith("回复") else "")
+
+
+def activity_days(text: str, rules: dict) -> float | None:
     """以标签的时间范围上界判断；不把发布时间、回复率当成活跃时间。"""
     text = compact(text)
     values: list[float] = []
-    for pattern, days in [
-        (r"(?:刚刚|刚才|今日|今天)(?:活跃|回复(?!率))", 0),
-        (r"(?:当前|正在)?在线", 0),
-        (r"(?:昨日|昨天)(?:活跃|回复(?!率))", 1),
-        (r"前天(?:活跃|回复(?!率))", 2),
-        (r"本周(?:活跃|回复(?!率))", 7),
-        (r"本月(?:活跃|回复(?!率))", 31),
-    ]:
-        if re.search(pattern, text):
-            values.append(float(days))
+    for label, days in rules["text_days"].items():
+        if re.search(activity_term_pattern(label), text):
+            values.append(days)
+    units = {compact(unit): minutes for unit, minutes in rules["unit_minutes"].items()}
+    unit_pattern = "|".join(re.escape(unit) for unit in sorted(units, key=len, reverse=True))
+    suffix_pattern = "|".join(activity_term_pattern(suffix) for suffix in rules["suffixes"])
     pattern = (
         r"(?P<number>\d+(?:\.\d+)?|[零一二两三四五六七八九十百半]+)"
-        r"(?P<unit>分钟|小时|个月|日|天|周|月|年)"
-        r"(?:以内|以前|之内|内|前|以来)?(?:活跃|回复(?!率))"
+        rf"(?P<unit>{unit_pattern})"
+        rf"(?:以内|以前|之内|内|前|以来)?(?:{suffix_pattern})"
     )
-    units = {"分钟": 1 / 1440, "小时": 1 / 24, "日": 1, "天": 1,
-             "周": 7, "个月": 31, "月": 31, "年": 366}
     for match in re.finditer(pattern, text):
         number = chinese_number(match["number"])
         if number is not None:
-            values.append(number * units[match["unit"]])
+            values.append(number * units[match["unit"]] / 1440)
     # 同时出现多个标签时采用较大的时间范围，避免矛盾信息被当成近期。
     return max(values) if values else None
 
 
-def extract_job(header: list[TextLine], footer: list[TextLine], min_score: float = 0.65) -> JobInfo:
+def extract_job(header: list[TextLine], footer: list[TextLine], config: dict) -> JobInfo:
+    min_score = config["ocr"]["min_confidence"]
+    detail_markers = {compact(marker) for marker in config["ocr"]["detail_markers"]}
     header = [line for line in header if line.score >= min_score]
     footer = [line for line in footer if line.score >= min_score]
-    anchor_lines = [line for line in header if DETAIL.fullmatch(compact(line.text))]
+    anchor_lines = [line for line in header if compact(line.text) in detail_markers]
     cutoff = min((line.top for line in anchor_lines), default=0.60)
     rows = group_rows([line for line in header if line.bottom < cutoff])
     job = JobInfo(is_detail=bool(anchor_lines))
@@ -166,20 +158,26 @@ def extract_job(header: list[TextLine], footer: list[TextLine], min_score: float
                        and len(compact(line.text)) >= 2
                        and re.search(r"[\u4e00-\u9fffA-Za-z]", line.text)]
         job.title = "".join(line.text for line in title_lines)
-        recruiter_rows = rows[metadata_index + 1:]
-        activity_rows = [" ".join(line.text for line in row) for row in recruiter_rows
-                         if any(STATUS.search(line.text) for line in row)]
-        job.activity = " | ".join(activity_rows)
-        job.active_days = activity_days(job.activity)
+        rules = config["activity"]
+        activity_markers = tuple(compact(marker) for marker in (*rules["text_days"], *rules["suffixes"]))
+        activity_rows = []
         stable = [job.title, job.location]
-        stable.extend("".join(line.text for line in row) for row in recruiter_rows
-                      if not any(STATUS.search(line.text) or "发布" in line.text for line in row))
+        for row in rows[metadata_index + 1:]:
+            text = " ".join(line.text for line in row)
+            normalized = compact(text)
+            if any(marker in normalized for marker in activity_markers):
+                activity_rows.append(text)
+            elif "发布" not in normalized:
+                stable.append(normalized)
+        job.activity = " | ".join(activity_rows)
+        job.active_days = activity_days(job.activity, rules)
         job.key = hashlib.sha256(compact("|".join(stable)).encode("utf-8")).hexdigest()[:20]
 
     footer_text = "|".join(compact(line.text) for line in footer)
     # 已沟通状态优先，避免“继续沟通”被按钮图片的相似部分误匹配。
-    for text in ("继续沟通", "已沟通", "已投递", "立即沟通", "去聊聊", "立即投递"):
-        if text in footer_text:
+    buttons = config["button_texts"]
+    for text in (*buttons["contacted"], *buttons["clickable"]):
+        if compact(text) in footer_text:
             job.button_text = text
             break
     return job
@@ -188,14 +186,12 @@ def extract_job(header: list[TextLine], footer: list[TextLine], min_score: float
 def evaluate(job: JobInfo, config: dict) -> Decision:
     if not job.is_detail:
         return Decision("review", "未找到职位详情标记，请确认停留在岗位首屏")
-    if job.button_text in {"继续沟通", "已沟通", "已投递"}:
+    buttons = config["button_texts"]
+    if job.button_text in buttons["contacted"]:
         return Decision("skip", "已经沟通或投递")
     settings = config["filters"]
-    excluded = settings.get("exclude_title_keywords", DEFAULT_EXCLUDED_TITLES)
-    if not isinstance(excluded, (list, tuple)) or not all(isinstance(word, str) and word.strip() for word in excluded):
-        raise ValueError("filters.exclude_title_keywords 必须是字符串列表，每个词不能为空")
     title = compact(job.title).casefold()
-    for word in excluded:
+    for word in settings["exclude_title_keywords"]:
         if compact(word).casefold() in title:
             return Decision("skip", f"岗位标题命中排除词：{word}")
     if not job.location:
@@ -210,10 +206,10 @@ def evaluate(job: JobInfo, config: dict) -> Decision:
             return Decision("review", f"地点格式不明确：{job.location}")
         return Decision("skip", f"工作地点不在允许城市：{job.location}")
     if job.active_days is None:
-        return Decision("review", f"活跃时间未知：{job.activity or '未读到状态'}")
+        return Decision(settings["unknown_activity"], f"活跃时间未知：{job.activity or '未读到状态'}")
     maximum = settings["max_active_days"]
     if job.active_days > maximum:
         return Decision("skip", f"招聘者状态超过 {maximum} 天：{job.activity}")
-    if job.button_text not in {"立即沟通", "去聊聊", "立即投递"}:
+    if job.button_text not in buttons["clickable"]:
         return Decision("review", "未识别到可投递按钮")
     return Decision("pass", f"城市符合，招聘者状态在 {maximum} 天以内")

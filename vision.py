@@ -43,7 +43,7 @@ class ScreenReader:
     def analyze(self, image):
         header = self.read_region(image, self.config["ocr"]["header_region"])
         footer = self.read_region(image, self.config["ocr"]["footer_region"])
-        return extract_job(header, footer, self.config["ocr"]["min_confidence"])
+        return extract_job(header, footer, self.config)
 
 
 def find_button(image, config: dict, base_dir: Path) -> tuple[int, int, float] | None:

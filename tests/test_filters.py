@@ -1,10 +1,12 @@
 import unittest
 from dataclasses import replace
 
-from filters import JobInfo, TextLine, activity_days, evaluate, extract_job
+from filters import TextLine, activity_days, evaluate, extract_job
+from main import BASE_DIR, load_config
 
 
-CONFIG = {"filters": {"allowed_cities": ["武汉"], "max_active_days": 7}}
+CONFIG = load_config(BASE_DIR / "config.json")
+ACTIVITY = CONFIG["activity"]
 
 
 def line(text, x, y, width=0.3, score=0.99):
@@ -38,62 +40,64 @@ class ActivityTests(unittest.TestCase):
                                "30分钟前回复丨今日回复5次": 30 / 1440,
                                "2小时前活跃": 2 / 24}.items():
             with self.subTest(text=text):
-                self.assertAlmostEqual(activity_days(text), expected)
+                self.assertAlmostEqual(activity_days(text, ACTIVITY), expected)
 
     def test_long_labels_without_image_templates(self):
         for text in ["两个月内活跃", "2个月内活跃", "半年内活跃", "半年前活跃",
                      "一个月内活跃", "30天前活跃", "一年内活跃", "十五天内活跃"]:
             with self.subTest(text=text):
-                self.assertGreater(activity_days(text), 7)
+                self.assertGreater(activity_days(text, ACTIVITY), 7)
 
     def test_no_invented_time(self):
         for text in ["", "回复率高", "近期活跃", "该职位于昨日新发布", "今日回复率高"]:
             with self.subTest(text=text):
-                self.assertIsNone(activity_days(text))
+                self.assertIsNone(activity_days(text, ACTIVITY))
 
     def test_conflicting_labels_use_larger_range(self):
-        self.assertGreater(activity_days("今日回复1次 | 两个月内活跃"), 7)
+        self.assertGreater(activity_days("今日回复1次 | 两个月内活跃", ACTIVITY), 7)
 
 
 class FilterTests(unittest.TestCase):
     def test_sample_layout_with_wrapped_title(self):
-        job = extract_job(header(), FOOTER)
+        job = extract_job(header(), FOOTER, CONFIG)
         self.assertEqual(job.location, "武汉·洪山区")
         self.assertEqual(job.title, "容器运维工程师（武汉）")
         self.assertEqual(evaluate(job, CONFIG).action, "pass")
 
     def test_company_and_title_city_do_not_override_location(self):
-        job = extract_job(header(location="深圳·南山区"), FOOTER)
+        job = extract_job(header(location="深圳·南山区"), FOOTER, CONFIG)
         self.assertIn("武汉", job.title)
         self.assertEqual(evaluate(job, CONFIG).action, "skip")
-        job = extract_job(header(), FOOTER)
+        job = extract_job(header(), FOOTER, CONFIG)
         self.assertEqual(evaluate(job, CONFIG).action, "pass")  # 公司在北京也可投。
 
     def test_description_below_anchor_cannot_make_hr_active(self):
-        job = extract_job(header(activity="回复率高"), FOOTER)
+        job = extract_job(header(activity="回复率高"), FOOTER, CONFIG)
         self.assertIsNone(job.active_days)
         self.assertEqual(evaluate(job, CONFIG).action, "review")
+        config = {**CONFIG, "filters": {**CONFIG["filters"], "unknown_activity": "skip"}}
+        self.assertEqual(evaluate(job, config).action, "skip")
 
     def test_old_status_and_boundary(self):
         for text, action in [("7日内活跃", "pass"), ("8日内活跃", "skip"),
                              ("两个月内活跃", "skip"), ("半年内活跃", "skip")]:
             with self.subTest(text=text):
-                job = extract_job(header(activity=text), FOOTER)
+                job = extract_job(header(activity=text), FOOTER, CONFIG)
                 self.assertEqual(evaluate(job, CONFIG).action, action)
 
     def test_merged_metadata_box(self):
         lines = [item for item in header() if item.top != 0.22]
         lines.append(line("武汉·洪山区 3-5年 本科", 0.08, 0.22, 0.78))
-        job = extract_job(lines, FOOTER)
+        job = extract_job(lines, FOOTER, CONFIG)
         self.assertEqual(job.location, "武汉·洪山区")
         self.assertEqual(evaluate(job, CONFIG).action, "pass")
 
     def test_already_contacted(self):
-        job = extract_job(header(), [line("继续沟通", 0.40, 0.94)])
+        job = extract_job(header(), [line("继续沟通", 0.40, 0.94)], CONFIG)
         self.assertEqual(evaluate(job, CONFIG).action, "skip")
 
     def test_default_title_filter_skips_only_matching_titles(self):
-        job = extract_job(header(), FOOTER)
+        job = extract_job(header(), FOOTER, CONFIG)
         for title, word in [
             ("朝九晚五 不加班 双休\n经理 助理", "经理助理"),
             ("招聘专员", "招聘专员"),
@@ -109,32 +113,46 @@ class FilterTests(unittest.TestCase):
                 self.assertEqual(evaluate(replace(job, title=title), CONFIG).action, "pass")
 
     def test_custom_title_exclusions_replace_defaults(self):
-        job = replace(extract_job(header(), FOOTER), title="后台数据审核专员")
-        config = {"filters": {**CONFIG["filters"], "exclude_title_keywords": []}}
+        job = replace(extract_job(header(), FOOTER, CONFIG), title="后台数据审核专员")
+        config = {**CONFIG, "filters": {**CONFIG["filters"], "exclude_title_keywords": []}}
         self.assertEqual(evaluate(job, config).action, "pass")
         config["filters"]["exclude_title_keywords"] = ["后台数据审核"]
         self.assertEqual(evaluate(job, config).action, "skip")
-        config["filters"]["exclude_title_keywords"] = "后台数据审核"
-        with self.assertRaisesRegex(ValueError, "字符串列表"):
-            evaluate(job, config)
+
+    def test_configured_labels_are_used_for_ocr_and_filtering(self):
+        config = {
+            **CONFIG,
+            "ocr": {**CONFIG["ocr"], "detail_markers": ["岗位资料"]},
+            "activity": {"text_days": {"近期登录": 3}, "unit_minutes": {"小时": 120}, "suffixes": ["登录"]},
+            "button_texts": {"clickable": ["联系招聘者"], "contacted": ["已联系"]},
+        }
+        for status, expected_days in [("近期登录", 3), ("48小时前登录", 4)]:
+            with self.subTest(status=status):
+                lines = [replace(item, text="岗位资料") if item.text == "职位详情" else item
+                         for item in header(activity=status)]
+                job = extract_job(lines, [line("联系招聘者", 0.40, 0.94)], config)
+                self.assertEqual(job.active_days, expected_days)
+                self.assertEqual(evaluate(job, config).action, "pass")
+                job = extract_job(lines, [line("已联系", 0.40, 0.94)], config)
+                self.assertEqual(evaluate(job, config).action, "skip")
 
     def test_missing_or_low_confidence_data_does_not_pass(self):
-        job = extract_job(header(), FOOTER)
+        job = extract_job(header(), FOOTER, CONFIG)
         for changed in [replace(job, location=""), replace(job, active_days=None),
                         replace(job, button_text=""), replace(job, is_detail=False),
                         replace(job, location="武汉洪山区")]:
             self.assertEqual(evaluate(changed, CONFIG).action, "review")
         poor = [replace(item, score=0.3) if item.text.startswith("武汉·") else item for item in header()]
-        self.assertEqual(evaluate(extract_job(poor, FOOTER), CONFIG).action, "review")
+        self.assertEqual(evaluate(extract_job(poor, FOOTER, CONFIG), CONFIG).action, "review")
 
     def test_city_boundary(self):
-        job = extract_job(header(), FOOTER)
+        job = extract_job(header(), FOOTER, CONFIG)
         self.assertEqual(evaluate(replace(job, location="武汉市·洪山区"), CONFIG).action, "pass")
         self.assertNotEqual(evaluate(replace(job, location="武汉县·某区"), CONFIG).action, "pass")
 
     def test_key_ignores_changing_reply_time(self):
-        before = extract_job(header(activity="9分钟前回复"), FOOTER)
-        after = extract_job(header(activity="10分钟前回复"), [line("继续沟通", 0.4, 0.94)])
+        before = extract_job(header(activity="9分钟前回复"), FOOTER, CONFIG)
+        after = extract_job(header(activity="10分钟前回复"), [line("继续沟通", 0.4, 0.94)], CONFIG)
         self.assertEqual(before.key, after.key)
 
 

@@ -108,8 +108,9 @@ class FlowTests(unittest.TestCase):
                 self.assertIs(records[1].args[2], self.image)
 
     def test_late_chat_is_recovered_before_continuing(self):
+        self.config["button_texts"]["contacted"] = ["已联系"]
         self.reader.analyze.side_effect = [
-            self.job, self.job, JobInfo(), replace(self.job, button_text="继续沟通"),
+            self.job, self.job, JobInfo(), replace(self.job, button_text="已联系"),
         ]
         with patch("vision.find_button", return_value=(200, 850, 0.99)):
             _, _, decision = main.contact(self.desktop, self.reader, self.config, self.job)
@@ -130,12 +131,13 @@ class FlowTests(unittest.TestCase):
         self.desktop.swipe_left.assert_not_called()
 
     def test_unconfirmed_click_counts_towards_limit(self):
-        self.config["limits"].update(max_jobs=2, max_clicks=1)
+        self.config["limits"].update(max_jobs=2, max_clicks=1, contact_checks=1)
         with patch("main.Desktop", return_value=self.desktop), \
                 patch("vision.find_button", return_value=(200, 850, 0.99)):
             main.run_desktop(self.config, self.reader, self.audit, live=True)
         self.desktop.click.assert_called_once()
         self.desktop.swipe_left.assert_not_called()
+        self.assertEqual(self.reader.analyze.call_count, 3)
 
     def test_consecutive_template_failures_stop(self):
         self.config["limits"]["max_jobs"] = 10
@@ -151,10 +153,28 @@ class FlowTests(unittest.TestCase):
         import tempfile
         with tempfile.TemporaryDirectory() as folder:
             path = main.Path(folder) / "config.json"
-            self.config["filters"]["allowed_cities"] = []
-            path.write_text(json.dumps(self.config), encoding="utf-8")
-            with self.assertRaises(ValueError):
-                main.load_config(path)
+            for filters, expected in [
+                ({"allowed_cities": []}, "allowed_cities"),
+                ({"exclude_title_keywords": "经理助理"}, "exclude_title_keywords"),
+                ({"unknown_activity": "pass"}, "unknown_activity"),
+            ]:
+                with self.subTest(filters=filters):
+                    path.write_text(json.dumps({"filters": filters}), encoding="utf-8")
+                    with self.assertRaisesRegex(ValueError, expected):
+                        main.load_config(path)
+
+    def test_old_custom_config_keeps_values_and_loads_new_defaults(self):
+        import json
+        import tempfile
+        with tempfile.TemporaryDirectory() as folder:
+            path = main.Path(folder) / "old-config.json"
+            old = {"filters": {"allowed_cities": ["长沙"], "max_active_days": 14}}
+            path.write_text(json.dumps(old), encoding="utf-8")
+            config = main.load_config(path)
+        self.assertEqual(config["filters"]["allowed_cities"], ["长沙"])
+        self.assertEqual(config["filters"]["max_active_days"], 14)
+        self.assertIn("经理助理", config["filters"]["exclude_title_keywords"])
+        self.assertIn("继续沟通", config["button_texts"]["contacted"])
 
 
 if __name__ == "__main__":
